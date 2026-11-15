@@ -31,6 +31,8 @@ struct t2bce_device {
     bool no_state_fallback;
     bool no_state_resume;
     bool mailbox_channel_active;
+    bool shutdown_quiesced;
+    struct sys_off_handler *poweroff_handler;
     bool dma_irq_disabled;
     struct mutex pm_lock;
     struct mutex dma_completion_lock;

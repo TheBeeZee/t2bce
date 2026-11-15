@@ -2,6 +2,7 @@
 #include <linux/module.h>
 #include <linux/crc32.h>
 #include <linux/delay.h>
+#include <linux/reboot.h>
 #include <linux/version.h>
 
 /*
@@ -83,6 +84,42 @@ static void bce_free_state_buffer(struct t2bce_device *bce)
     bce->saved_data_dma_ptr = NULL;
     bce->saved_data_dma_addr = 0;
     bce->saved_data_dma_size = 0;
+}
+
+/*
+ * Ask bridgeOS to sleep right before the host enters S5. Otherwise only the
+ * suspend path ever sends it a sleep request, and the battery drains while
+ * the Mac is powered off.
+ *
+ * This has to run late: the T2 also hosts the NVMe controller (function 0).
+ * pci0_link makes this device a consumer of function 0, so device_shutdown()
+ * calls t2bce_shutdown() before the NVMe driver shuts the drive down.
+ * POWER_OFF_PREPARE handlers run after device_shutdown() has completed, so the
+ * drive is shut down first. They run in descending priority order, so at
+ * SYS_OFF_PRIO_DEFAULT this also runs after the ACPI _PTS handler
+ * (SYS_OFF_PRIO_FIRMWARE). They do not run on restart.
+ */
+static int t2bce_power_off_prepare(struct sys_off_data *data)
+{
+    struct t2bce_device *bce = data->cb_data;
+
+    /* t2bce_shutdown() paused the mailbox channel and still holds it. */
+    if (!bce->shutdown_quiesced)
+        return NOTIFY_DONE;
+
+    if (bce_mailbox_send_no_reply_locked(&bce->mbox, BCE_MB_MSG(BCE_MB_SLEEP_NO_STATE, 0))) {
+        pr_warn("t2bce_core: power-off: SLEEP_NO_STATE send failed\n");
+        return NOTIFY_DONE;
+    }
+
+    pr_info("t2bce_core: power-off: asked bridgeOS to sleep\n");
+    /*
+     * No reply is expected. Give bridgeOS a moment before the platform
+     * enters S5; 100 ms is the delay this was tested with, not a known
+     * minimum.
+     */
+    msleep(100);
+    return NOTIFY_DONE;
 }
 
 static int t2bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
@@ -201,6 +238,20 @@ static int t2bce_probe(struct pci_dev *dev, const struct pci_device_id *id)
     }
 
     global_bce = bce;
+
+    /*
+     * SYS_OFF_PRIO_DEFAULT: any other priority must be unique on the chain
+     * and registration would fail if another handler already used it.
+     */
+    bce->poweroff_handler = register_sys_off_handler(SYS_OFF_MODE_POWER_OFF_PREPARE,
+                                                     SYS_OFF_PRIO_DEFAULT,
+                                                     t2bce_power_off_prepare, bce);
+    if (IS_ERR(bce->poweroff_handler)) {
+        dev_warn(&dev->dev, "t2bce_core: failed to register power-off handler: %ld\n",
+                 PTR_ERR(bce->poweroff_handler));
+        bce->poweroff_handler = NULL;
+    }
+
     pr_info("t2bce_core: device initialized\n");
 
     return 0;
@@ -515,6 +566,7 @@ static int t2bce_dma_flush_queue(void *userdata, u16 qid)
 static void t2bce_remove(struct pci_dev *dev)
 {
     struct t2bce_device *bce = pci_get_drvdata(dev);
+    unregister_sys_off_handler(bce->poweroff_handler);
     bce->is_being_removed = true;
     bce->dma.is_being_removed = true;
     global_bce = NULL;
@@ -569,6 +621,8 @@ static void t2bce_shutdown(struct pci_dev *dev)
         status = bce_pm_channel_pause(bce);
         if (status)
             pr_warn("t2bce_core: shutdown mailbox quiesce failed: %d\n", status);
+        else
+            bce->shutdown_quiesced = true; /* t2bce_power_off_prepare() may send */
     }
 
     mutex_unlock(&bce->pm_lock);
